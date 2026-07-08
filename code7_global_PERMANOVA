@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import json
+import argparse
+import pandas as pd
+
+from skbio.stats.distance import DistanceMatrix, permanova
+
+LEVEL = "ASV"
+FACTOR = "niche_category"
+BASE_OUTPUT_PREFIX = "./saved_matrices"
+
+META_LOCAL = "./metadata_17March_with_taxa.csv"
+META_FALLBACK = "/usr/local/storage/ebi-data/metadata_onlyhere/metadata_17March_with_taxa.csv"
+
+
+def _metadata_path():
+    if os.path.exists(META_LOCAL):
+        return META_LOCAL
+    if os.path.exists(META_FALLBACK):
+        return META_FALLBACK
+    sys.exit("Error: metadata_17March_with_taxa.csv not found.")
+
+
+def level_root(level):
+    return "{}_{}".format(BASE_OUTPUT_PREFIX, level)
+
+
+def load_metadata():
+    meta_path = _metadata_path()
+    try:
+        meta = pd.read_csv(
+            meta_path,
+            index_col="Run",
+            dtype=str,
+            low_memory=False
+        )
+    except Exception as e:
+        sys.exit("Error loading metadata ({}): {}".format(meta_path, e))
+
+    meta.index = meta.index.astype(str)
+    return meta, meta_path
+
+
+def load_bc_matrix(level, dataset_dir):
+    f = os.path.join(dataset_dir, "bc_matrix_{}.csv".format(level))
+
+    if not os.path.exists(f):
+        sys.exit("Missing Bray-Curtis matrix: {}".format(f))
+
+    try:
+        dm_df = pd.read_csv(f, index_col=0, low_memory=False)
+    except Exception as e:
+        sys.exit("Error loading Bray-Curtis matrix ({}): {}".format(f, e))
+
+    dm_df.index = dm_df.index.astype(str)
+    dm_df.columns = dm_df.columns.astype(str)
+
+    common = dm_df.index.intersection(dm_df.columns)
+
+    if len(common) < 3:
+        sys.exit("Distance matrix has fewer than 3 matching row/column sample IDs.")
+
+    dm_df = dm_df.loc[common, common]
+    dm_df = dm_df.apply(pd.to_numeric, errors="coerce")
+
+    if dm_df.isna().any().any():
+        sys.exit("Distance matrix contains NA/non-numeric values.")
+
+    if dm_df.shape[0] != dm_df.shape[1]:
+        sys.exit("Distance matrix is not square.")
+
+    if not (dm_df.index == dm_df.columns).all():
+        sys.exit("Distance matrix row/column order mismatch.")
+
+    return dm_df, f
+
+
+def run_permanova_from_bc(dm_df, metadata, factor, perms=999):
+    if factor not in metadata.columns:
+        sys.exit("Metadata does not contain required factor column: {}".format(factor))
+
+    common = dm_df.index.intersection(metadata.index)
+
+    if len(common) < 3:
+        sys.exit("Too few overlapping samples between distance matrix and metadata.")
+
+    g = metadata.loc[common, factor]
+
+    g = g.astype(str)
+    mask = (g != "nan") & (g != "") & (~g.isna())
+
+    used_samples = g.index[mask].tolist()
+    g = g.loc[used_samples]
+
+    if len(used_samples) < 3:
+        sys.exit("Too few usable samples after removing missing metadata.")
+
+    if g.nunique() < 2:
+        sys.exit("Need at least 2 groups in {} after filtering missing values.".format(factor))
+
+    dm_sub = dm_df.loc[used_samples, used_samples]
+
+    dm = DistanceMatrix(
+        dm_sub.to_numpy(),
+        ids=dm_sub.index.tolist()
+    )
+
+    # Compatible with older scikit-bio versions
+    res = permanova(
+        dm,
+        g,
+        permutations=perms
+    )
+
+    return res, used_samples
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="Run PERMANOVA using precomputed Bray-Curtis matrix."
+    )
+
+    ap.add_argument(
+        "--dataset-dir",
+        default=level_root(LEVEL),
+        help="Directory containing bc_matrix_ASV.csv. Default: ./saved_matrices_ASV"
+    )
+
+    ap.add_argument(
+        "--permutations",
+        type=int,
+        default=999,
+        help="Number of permutations. Default: 999"
+    )
+
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    dataset_dir = args.dataset_dir
+    perms = args.permutations
+
+    print("\n=== PERMANOVA from existing Bray-Curtis matrix ===")
+    print("Level        : {}".format(LEVEL))
+    print("Dataset dir  : {}".format(os.path.abspath(dataset_dir)))
+    print("Factor       : {}".format(FACTOR))
+    print("Permutations : {}\n".format(perms))
+
+    dm_df, bc_path = load_bc_matrix(LEVEL, dataset_dir)
+    metadata, meta_path = load_metadata()
+
+    print("BC matrix file: {}".format(bc_path))
+    print("Metadata file : {}".format(meta_path))
+    print("Matrix samples: {}".format(dm_df.shape[0]))
+    print("Running PERMANOVA ...")
+
+    res, used_samples = run_permanova_from_bc(
+        dm_df,
+        metadata,
+        FACTOR,
+        perms=perms
+    )
+
+    print("\n=== RESULT ===")
+
+    try:
+        res_df = res.to_frame().T
+        print(res_df.to_string(index=False))
+    except Exception:
+        print(str(res))
+        res_df = pd.DataFrame([dict(res)])
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(dataset_dir, "permanova_reports")
+    os.makedirs(out_dir, exist_ok=True)
+
+    base = "permanova_fromBC_{}_{}_{}".format(LEVEL, FACTOR, stamp)
+    out_tsv = os.path.join(out_dir, base + ".tsv")
+    out_meta = os.path.join(out_dir, base + ".meta.json")
+
+    res_df.to_csv(out_tsv, sep="\t", index=False)
+
+    meta_info = {
+        "level": LEVEL,
+        "factor": FACTOR,
+        "dataset_dir": os.path.abspath(dataset_dir),
+        "bc_matrix_path": os.path.abspath(bc_path),
+        "metadata_path": os.path.abspath(meta_path),
+        "permutations": perms,
+        "n_matrix_samples": int(dm_df.shape[0]),
+        "n_samples_used": len(used_samples),
+        "samples_used_preview": used_samples[:20],
+        "timestamp": stamp,
+    }
+
+    with open(out_meta, "w") as f:
+        json.dump(meta_info, f, indent=2)
+
+    print("\nSaved:")
+    print("  - {}".format(out_tsv))
+    print("  - {}".format(out_meta))
+    print("\nDone.\n")
+
+
+if __name__ == "__main__":
+    main()
