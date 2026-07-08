@@ -22,7 +22,7 @@ python3 code1_accession_to_final_fasta.py \
 *** note - it is best to examine the SraRunTable.csv yourself and remove any sample you don't want. Also remove any WGS samples (they may be indicated as WGS or you may use the total file size) - as WGS will massively slow down the code with their download, merging etc. and will be deleted nevertheless
 
 
-# code 2
+### code 2
 python3 code2_rename_merge_check.py  \
  --root /path_to_fasta_files/ \
  --metadata /path_to_metadata_file \
@@ -36,7 +36,7 @@ python3 code2_rename_merge_check.py  \
  --min-len 220 --max-len 255
 
 
-#code 3 - unified
+### code 3 - unified
 The code is designed for HPC - the code was run using slurm
 
 Copy codes into a folder containing all_samples.fasta and the metadata file. 
@@ -47,10 +47,10 @@ You may need to change the node and/or the input method to match your HPC specif
 
 
 
-#code4 - taxonomy - panel-based code - upon running a new tab in Firefox should open - if not copy the address manually into your web browser
-#code5 - pcoa (as code4)
-#code6 - shannon (as code5)
-#code7 - shannon, betadisp, and within study permanova - run using slurm
+### code4 - taxonomy - panel-based code - upon running a new tab in Firefox should open - if not copy the address manually into your web browser
+### code5 - pcoa (as code4)
+### code6 - shannon (as code5)
+### code7 - shannon, betadisp, and within study permanova - run using slurm
 python3 shannon_compute_all_hpc.py
 
 echo "Job started on: $(hostname)"
@@ -85,5 +85,5 @@ echo ""
 echo "End time: $(date)"
 echo "Job finished"
 
-#code7 global PERMANOVA - run using slurm
+### code8 global PERMANOVA - run using slurm
 
