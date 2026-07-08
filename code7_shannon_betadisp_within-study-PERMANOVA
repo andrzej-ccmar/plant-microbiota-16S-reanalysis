@@ -1,0 +1,459 @@
+[andrzej@ceta manyniches_Ping_Xu_2Jul26]$ cat code_to_betadisper_ASV_endosphere_noBoechera_host_category_direct.py 
+#!/usr/bin/env python3
+
+import argparse
+import multiprocessing as mp
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+FACTOR = "host_category"
+
+
+def normalise_text(x):
+    if pd.isna(x):
+        return np.nan
+    return str(x).strip().lower().replace("_", " ")
+
+
+def read_table_auto(path):
+    path = Path(path)
+
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path, low_memory=False)
+
+    return pd.read_csv(path, sep="\t", low_memory=False)
+
+
+def find_run_col(metadata):
+    candidates = [
+        "Run",
+        "run",
+        "sample",
+        "sample_id",
+        "sample id",
+        "SampleID",
+        "Sample_ID",
+    ]
+
+    for c in candidates:
+        if c in metadata.columns:
+            return c
+
+    return metadata.columns[0]
+
+
+def clean_group_labels(x):
+    out = []
+
+    for v in x:
+        if pd.isna(v):
+            out.append(np.nan)
+        else:
+            s = str(v).strip()
+            if s == "" or s.lower() in ["nan", "na", "none"]:
+                out.append(np.nan)
+            else:
+                out.append(s)
+
+    return np.asarray(out, dtype=object)
+
+
+def distances_to_group_centroids(D, groups, min_group_size=2):
+    """
+    Distance-to-centroid calculation using squared distance matrix.
+
+    For sample i in group g:
+
+    d(i, centroid_g)^2 =
+        mean_j d(i,j)^2 - mean_jk d(j,k)^2 / 2
+
+    This avoids full PCoA eigendecomposition and is much lighter for
+    large Bray-Curtis matrices.
+    """
+
+    groups = np.asarray(groups)
+    D2 = D.astype(np.float64, copy=False) ** 2
+
+    distances = np.full(len(groups), np.nan, dtype=np.float64)
+    group_rows = []
+
+    for g in pd.unique(groups):
+        idx = np.where(groups == g)[0]
+        n = len(idx)
+
+        if n < min_group_size:
+            continue
+
+        sub = D2[np.ix_(idx, idx)]
+
+        row_mean = sub.mean(axis=1)
+        centroid_term = sub.sum() / (2.0 * n * n)
+
+        dist2 = row_mean - centroid_term
+        dist2[dist2 < 0] = 0.0
+
+        d = np.sqrt(dist2)
+        distances[idx] = d
+
+        group_rows.append({
+            "group": g,
+            "n": n,
+            "mean_distance_to_centroid": float(np.mean(d)),
+            "median_distance_to_centroid": float(np.median(d)),
+            "sd_distance_to_centroid": float(np.std(d, ddof=1)) if n > 1 else np.nan,
+            "min_distance_to_centroid": float(np.min(d)),
+            "max_distance_to_centroid": float(np.max(d)),
+        })
+
+    return distances, pd.DataFrame(group_rows)
+
+
+def anova_f_from_distances(distances, groups):
+    ok = ~pd.isna(distances) & ~pd.isna(groups)
+
+    x = np.asarray(distances[ok], dtype=np.float64)
+    g = np.asarray(groups[ok], dtype=object)
+
+    unique_groups, codes = np.unique(g, return_inverse=True)
+
+    n_total = len(x)
+    k = len(unique_groups)
+
+    if k < 2:
+        return np.nan, np.nan, np.nan, np.nan, n_total, k
+
+    grand_mean = np.mean(x)
+
+    counts = np.bincount(codes)
+    sums = np.bincount(codes, weights=x)
+    means = sums / counts
+
+    ss_between = np.sum(counts * (means - grand_mean) ** 2)
+
+    ss_within = 0.0
+    for i in range(k):
+        vals = x[codes == i]
+        ss_within += np.sum((vals - means[i]) ** 2)
+
+    df_between = k - 1
+    df_within = n_total - k
+
+    ms_between = ss_between / df_between
+    ms_within = ss_within / df_within
+
+    F = ms_between / ms_within if ms_within > 0 else np.nan
+    eta2 = ss_between / (ss_between + ss_within) if (ss_between + ss_within) > 0 else np.nan
+
+    return F, eta2, df_between, df_within, n_total, k
+
+
+_GLOBAL_DISTANCES = None
+_GLOBAL_GROUPS = None
+
+
+def _init_perm_worker(distances, groups):
+    global _GLOBAL_DISTANCES
+    global _GLOBAL_GROUPS
+
+    _GLOBAL_DISTANCES = distances
+    _GLOBAL_GROUPS = groups
+
+
+def _perm_worker(seed):
+    rng = np.random.default_rng(seed)
+
+    g_perm = rng.permutation(_GLOBAL_GROUPS)
+
+    F_perm, *_ = anova_f_from_distances(
+        _GLOBAL_DISTANCES,
+        g_perm
+    )
+
+    return F_perm
+
+
+def permutation_pvalue_parallel(
+    distances,
+    groups,
+    observed_F,
+    permutations=999,
+    seed=123,
+    workers=1
+):
+    ok = ~pd.isna(distances) & ~pd.isna(groups)
+
+    x = np.asarray(distances[ok], dtype=np.float64)
+    g = np.asarray(groups[ok], dtype=object)
+
+    if len(np.unique(g)) < 2:
+        return np.nan
+
+    if workers <= 1:
+        rng = np.random.default_rng(seed)
+
+        count_ge = 0
+
+        for _ in range(permutations):
+            g_perm = rng.permutation(g)
+            F_perm, *_ = anova_f_from_distances(x, g_perm)
+
+            if np.isfinite(F_perm) and F_perm >= observed_F:
+                count_ge += 1
+
+        return (count_ge + 1) / (permutations + 1)
+
+    seeds = [seed + i for i in range(permutations)]
+
+    with mp.Pool(
+        processes=workers,
+        initializer=_init_perm_worker,
+        initargs=(x, g)
+    ) as pool:
+        F_perms = pool.map(_perm_worker, seeds)
+
+    count_ge = sum(
+        1 for f in F_perms
+        if np.isfinite(f) and f >= observed_F
+    )
+
+    return (count_ge + 1) / (permutations + 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Direct betadisper for ASV endosphere_noBoechera using host_category."
+    )
+
+    parser.add_argument(
+        "--matrix",
+        default="./saved_matrices_ASV/endosphere_noBoechera/bc_matrix_ASV.csv",
+        help="ASV Bray-Curtis distance matrix CSV"
+    )
+
+    parser.add_argument(
+        "--metadata",
+        default="./metadata_17March_with_taxa.csv",
+        help="Metadata CSV/TSV"
+    )
+
+    parser.add_argument(
+        "--outdir",
+        default="./saved_matrices_ASV/endosphere_noBoechera/permanova_reports",
+        help="Output directory"
+    )
+
+    parser.add_argument(
+        "--permutations",
+        type=int,
+        default=9999,
+        help="Number of permutations"
+    )
+
+    parser.add_argument(
+        "--min-group-size",
+        type=int,
+        default=2,
+        help="Minimum group size to include"
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=24,
+        help="Number of worker processes for permutations"
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=123,
+        help="Random seed"
+    )
+
+    args = parser.parse_args()
+
+    matrix_path = Path(args.matrix)
+    metadata_path = Path(args.metadata)
+    outdir = Path(args.outdir)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print("[INFO] Starting direct betadisper analysis")
+    print(f"[INFO] Matrix: {matrix_path}")
+    print(f"[INFO] Metadata: {metadata_path}")
+    print(f"[INFO] Output directory: {outdir}")
+    print(f"[INFO] Factor: {FACTOR}")
+    print(f"[INFO] Permutations: {args.permutations}")
+    print(f"[INFO] Workers: {args.workers}")
+    print(f"[INFO] Minimum group size: {args.min_group_size}")
+
+    print("\n[INFO] Reading metadata")
+    metadata = read_table_auto(metadata_path)
+
+    run_col = find_run_col(metadata)
+
+    if FACTOR not in metadata.columns:
+        raise ValueError(
+            f"Could not find factor column '{FACTOR}'. "
+            f"Available columns are:\n{list(metadata.columns)}"
+        )
+
+    metadata[run_col] = metadata[run_col].astype(str)
+    metadata = metadata.set_index(run_col, drop=False)
+
+    print(f"[INFO] Metadata rows: {metadata.shape[0]}")
+    print(f"[INFO] Run column: {run_col}")
+    print(f"[INFO] Factor column: {FACTOR}")
+
+    print("\n[INFO] Reading Bray-Curtis matrix")
+    D_df = pd.read_csv(matrix_path, index_col=0)
+
+    D_df.index = D_df.index.astype(str)
+    D_df.columns = D_df.columns.astype(str)
+
+    common = D_df.index.intersection(D_df.columns)
+
+    if len(common) != D_df.shape[0]:
+        print(
+            f"[WARN] Matrix index/columns mismatch. "
+            f"Keeping common samples only: {len(common)}"
+        )
+
+    D_df = D_df.loc[common, common]
+
+    sample_ids = D_df.index.to_numpy(dtype=str)
+    D = D_df.to_numpy(dtype=np.float32, copy=True)
+
+    print(f"[INFO] Matrix size: {D.shape[0]} x {D.shape[1]}")
+
+    print("\n[INFO] Aligning metadata to matrix")
+    meta_sub = metadata.reindex(sample_ids)
+
+    missing_meta = meta_sub[run_col].isna().sum()
+    if missing_meta > 0:
+        print(f"[WARN] Samples in matrix missing from metadata: {missing_meta}")
+
+    labels = clean_group_labels(meta_sub[FACTOR].values)
+
+    # Safety filter: remove anything still containing Boechera.
+    labels_str = pd.Series(labels).astype(str)
+    boechera_mask = labels_str.str.contains("boechera", case=False, regex=True, na=False).to_numpy()
+
+    keep = ~pd.isna(labels) & ~boechera_mask
+
+    idx = np.where(keep)[0]
+
+    if len(idx) < 3:
+        raise ValueError("Too few samples after removing missing labels / Boechera")
+
+    groups = labels[idx]
+
+    counts_all = pd.Series(groups).value_counts()
+    good_groups = counts_all[counts_all >= args.min_group_size].index
+
+    keep2 = np.isin(groups, good_groups)
+
+    idx = idx[keep2]
+    groups = groups[keep2]
+
+    counts = pd.Series(groups).value_counts()
+
+    n_samples = len(groups)
+    n_groups = len(pd.unique(groups))
+
+    if n_groups < 2:
+        raise ValueError("Fewer than two groups after min-group-size filtering")
+
+    print(f"[INFO] Samples used: {n_samples}")
+    print(f"[INFO] Groups used: {n_groups}")
+    print(f"[INFO] Largest group n: {counts.max()}")
+    print(f"[INFO] Smallest group n: {counts.min()}")
+    print(f"[INFO] Group size ratio max/min: {counts.max() / counts.min():.2f}")
+
+    print("\n[INFO] Subsetting matrix")
+    D_use = D[np.ix_(idx, idx)]
+
+    print("[INFO] Calculating distances to group centroids")
+    distances, group_stats = distances_to_group_centroids(
+        D_use,
+        groups,
+        min_group_size=args.min_group_size,
+    )
+
+    F, eta2, df_between, df_within, n_used, k_used = anova_f_from_distances(
+        distances,
+        groups,
+    )
+
+    print("[INFO] Running permutation test")
+    p = permutation_pvalue_parallel(
+        distances,
+        groups,
+        F,
+        permutations=args.permutations,
+        seed=args.seed,
+        workers=args.workers,
+    )
+
+    mean_dist = group_stats["mean_distance_to_centroid"]
+
+    most_dispersed = group_stats.loc[mean_dist.idxmax(), "group"]
+    least_dispersed = group_stats.loc[mean_dist.idxmin(), "group"]
+
+    result = {
+        "dataset": "Endosphere_noBoechera",
+        "factor": "host_category",
+        "actual_factor_column": FACTOR,
+        "n_samples": n_samples,
+        "n_groups": n_groups,
+        "df_between": df_between,
+        "df_within": df_within,
+        "dispersion_F": F,
+        "dispersion_p": p,
+        "dispersion_eta2": eta2,
+        "mean_distance_min": float(mean_dist.min()),
+        "mean_distance_max": float(mean_dist.max()),
+        "mean_distance_range": float(mean_dist.max() - mean_dist.min()),
+        "mean_distance_ratio_max_min": float(mean_dist.max() / mean_dist.min()) if mean_dist.min() > 0 else np.nan,
+        "least_dispersed_group": least_dispersed,
+        "most_dispersed_group": most_dispersed,
+        "min_group_n": int(counts.min()),
+        "max_group_n": int(counts.max()),
+        "group_size_ratio_max_min": float(counts.max() / counts.min()),
+    }
+
+    summary_df = pd.DataFrame([result])
+
+    group_stats.insert(0, "dataset", "Endosphere_noBoechera")
+    group_stats.insert(1, "factor", "host_category")
+    group_stats.insert(2, "actual_factor_column", FACTOR)
+
+    sample_distances = pd.DataFrame({
+        "Run": sample_ids[idx],
+        "host_category": groups,
+        "distance_to_centroid": distances,
+    })
+
+    summary_path = outdir / "betadisper_host_category_endosphere_noBoechera_ASV.summary.tsv"
+    group_path = outdir / "betadisper_host_category_endosphere_noBoechera_ASV.group_distances.tsv"
+    sample_path = outdir / "betadisper_host_category_endosphere_noBoechera_ASV.sample_distances.tsv"
+
+    summary_df.to_csv(summary_path, sep="\t", index=False)
+    group_stats.to_csv(group_path, sep="\t", index=False)
+    sample_distances.to_csv(sample_path, sep="\t", index=False)
+
+    print("\n[RESULT]")
+    print(summary_df.to_string(index=False))
+
+    print("\n[DONE]")
+    print(f"[OUT] {summary_path}")
+    print(f"[OUT] {group_path}")
+    print(f"[OUT] {sample_path}")
+
+
+if __name__ == "__main__":
+    main()
+[andrzej@ceta
